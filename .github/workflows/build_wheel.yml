@@ -1,0 +1,199 @@
+# Build a single, fixed mmcv wheel for one version chain:
+#   CUDA 12  +  PyTorch 2.10  +  Python 3.11  +  CXX11 ABI = TRUE
+#
+# Modeled on the mamba-ssm `.github` build workflow, but collapsed to a single
+# version chain (no matrix).
+#
+# Release publishing (mirrors mamba's publish.yaml `setup_release` +
+# `_build.yml` release-asset steps):
+#   - On `push: tags: v*`: a GitHub release for the tag is created (if not
+#     already present) and the built wheel is uploaded to it.
+#   - On `workflow_dispatch`: only the wheel build artifact is produced.
+#
+# The CXX11 ABI is not set by mmcv directly: mmcv's setup.py inherits
+# `-D_GLIBCXX_USE_CXX11_ABI` from PyTorch's `torch.utils.cpp_extension`, which
+# matches `torch._C._GLIBCXX_USE_CXX11_ABI`. The official PyTorch 2.10 wheel is
+# built with ABI = TRUE, so building against it yields an ABI-TRUE mmcv wheel
+# automatically (asserted below).
+name: Build mmcv wheel (cu12 + torch2.10 + py3.11 + abiTRUE)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+
+# Needed to create the release and upload the wheel asset
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash -x -e -u -o pipefail {0}
+
+# ---- The single, fixed version chain --------------------------------------
+env:
+  PYTHON_VERSION: "3.11"
+  # "cu12": system CUDA 12.x used to compile the CUDA kernels
+  CUDA_VERSION: "12.8.1"
+  # PyTorch 2.10 official CUDA wheel flavour (cu128)
+  TORCH_VERSION: "2.10.0"
+  TORCH_CUDA_VERSION: "128"
+  CXX11_ABI: "TRUE"
+
+jobs:
+  # Create (or reuse) the GitHub release for the pushed tag.
+  setup_release:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    outputs:
+      release-version: ${{ steps.extract_tag.outputs.tag }}
+    steps:
+      - name: Get the tag version
+        id: extract_tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create Release (if not exists)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.extract_tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping creation."
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+
+  build-wheel:
+    needs: [setup_release]
+    # Still run on manual dispatch, where setup_release is skipped.
+    if: always() && !cancelled()
+    runs-on: ubuntu-22.04
+    # NOTE: the job `name` field cannot use the `env` context, so the fixed
+    # version chain is inlined here to keep it consistent with the artifact name.
+    name: mmcv-cu12-torch2.10-py3.11-abiTRUE
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Derive wheel CUDA major version
+        run: |
+          echo "WHEEL_CUDA_VERSION=$(echo ${{ env.CUDA_VERSION }} | awk -F \. {'print $1'})" >> $GITHUB_ENV
+
+      - name: Free up disk space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Set up swap space
+        if: runner.os == 'Linux'
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 10
+
+      - name: Install CUDA ${{ env.CUDA_VERSION }} toolkit
+        uses: Jimver/cuda-toolkit@v0.2.30
+        id: cuda-toolkit
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          linux-local-args: '["--toolkit"]'
+          method: "network"
+          # Install the FULL toolkit (all -dev header packages: cusparse, cublas,
+          # cufft, cusolver, curand, ...). Restricting to just ["nvcc"] leaves
+          # PyTorch's CUDA headers (e.g. ATen/cuda/CUDAContextLight.h which does
+          # `#include <cusparse.h>`) unable to compile.
+
+      - name: Install PyTorch ${{ env.TORCH_VERSION }}+cu${{ env.TORCH_CUDA_VERSION }}
+        run: |
+          pip install --upgrade pip
+          # Guard against the "no setuptools" error and a stale typing-extensions
+          pip install setuptools==68.0.0
+          pip install typing-extensions==4.12.2
+          pip install --no-cache-dir torch==${{ env.TORCH_VERSION }} \
+            --index-url https://download.pytorch.org/whl/cu${{ env.TORCH_CUDA_VERSION }}
+
+          # Sanity-check the exact version chain
+          nvcc --version
+          python --version
+          python -c "import torch; print('PyTorch:', torch.__version__)"
+          python -c "import torch; print('Torch CUDA:', torch.version.cuda)"
+          python -c "import torch; print('Torch CXX11_ABI:', torch._C._GLIBCXX_USE_CXX11_ABI)"
+          python - <<'PY'
+          import torch, sys
+          assert torch.__version__.startswith("2.10"), torch.__version__
+          assert sys.version_info[:2] == (3, 11), sys.version
+          assert torch._C._GLIBCXX_USE_CXX11_ABI is True, \
+              "expected PyTorch wheel built with CXX11 ABI = TRUE"
+          print("Version chain OK: cu12 + torch 2.10 + py 3.11 + ABI TRUE")
+          PY
+
+      - name: Install build dependencies
+        run: |
+          pip install ninja packaging wheel
+          # mmcv runtime/optional deps so the import + op self-check succeed later
+          python -m pip install -r requirements/runtime.txt -r requirements/optional.txt
+
+      - name: Build wheel
+        env:
+          # No GPU on the runner, but we still want the CUDA ops compiled.
+          FORCE_CUDA: "1"
+          MMCV_WITH_OPS: "1"
+          # Target compute capabilities to compile. MUST be set explicitly:
+          # on a GPU-less runner, torch's cpp_extension can't query the
+          # device and otherwise crashes in _get_cuda_arch_flags with
+          # `arch_list[-1] += '+PTX'` (IndexError on an empty list).
+          TORCH_CUDA_ARCH_LIST: "7.0;7.5;8.0;8.6;9.0;10.0"
+          # Limit parallel jobs so the runner does not OOM (mirrors mamba build.sh)
+          MAX_JOBS: "2"
+        run: |
+          python setup.py bdist_wheel --dist-dir=dist
+          wheel_name=$(ls dist/*.whl | xargs -n 1 basename)
+          echo "wheel_name=${wheel_name}" >> $GITHUB_ENV
+
+      - name: Log built wheels
+        run: ls -l dist
+
+      - name: Test wheel
+        run: |
+          pip install dist/*.whl
+          python -c "import mmcv; print('mmcv', mmcv.__version__)"
+          # Exercise a compiled op (CPU path; no GPU on the runner)
+          python .dev_scripts/check_installation.py
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmcv-cu12-torch2.10-py3.11-abiTRUE
+          path: dist/*.whl
+          if-no-files-found: error
+
+      # Upload the wheel to the release only when building from a tag
+      - name: Get Release with tag
+        id: get_release
+        if: github.ref_type == 'tag'
+        uses: joutvhu/get-release@v1
+        with:
+          tag_name: ${{ needs.setup_release.outputs.release-version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Release Asset
+        if: github.ref_type == 'tag'
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_path: ./dist/${{ env.wheel_name }}
+          asset_name: ${{ env.wheel_name }}
+          asset_content_type: application/*
