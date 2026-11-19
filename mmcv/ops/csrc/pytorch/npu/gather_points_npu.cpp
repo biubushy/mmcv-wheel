@@ -32,11 +32,7 @@ void gather_points_backward_npu(int b, int c, int n, int npoints,
     indices.unsqueeze_(0);
   }
   int64_t dim = 0;
-  auto shape = idx.sizes();
-  c10::SmallVector<int64_t, 8> pad_size;
-  for (uint64_t i = 0; i < shape.size(); i++) {
-    pad_size.emplace_back(shape[i]);
-  }
+  at::SmallVector<int64_t, N> pad_size = array_to_small_vector(idx.sizes());
   at::Tensor trans_grad_points = grad_points.transpose(1, 2).contiguous();
   at::Tensor grad_points_view = trans_grad_points.view(
       {trans_grad_points.sizes()[0] * trans_grad_points.sizes()[1],
